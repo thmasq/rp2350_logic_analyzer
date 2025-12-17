@@ -2,3 +2,4 @@ _*
 *.lck
 production
 *analyzer-backups
+fp-info-cache
