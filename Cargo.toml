@@ -1,0 +1,15 @@
+[package]
+name = "rp2350_logic_analyzer"
+version = "0.1.0"
+edition = "2024"
+authors = ["Thomas Q <thomasqsa@gmail.com>"]
+
+[dependencies]
+cortex-m = "0.7.8"
+cortex-m-rt = "0.7.6"
+defmt = "1.1.1"
+defmt-rtt = { version = "1.3.0", features = ["disable-blocking-mode"] }
+embedded-hal = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+rp2350-linker = "0.2.3"
+rp235x-hal = { version = "0.4.0", features = ["rt", "critical-section-impl", "defmt", "rom-func-cache", "dcp-fast-f64"] }
