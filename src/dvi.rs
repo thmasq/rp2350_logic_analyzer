@@ -4,7 +4,9 @@
 //! via `rp235x_hal::hstx::Hstx` in main.rs. This module only builds the
 //! constant command-list data that gets DMA'd into the HSTX FIFO.
 
-use rp235x_hal::hstx::{EXPANDER_CMD_NOP, EXPANDER_CMD_RAW_REPEAT, EXPANDER_CMD_TMDS};
+pub const EXPANDER_CMD_RAW_REPEAT: u32 = 1 << 12;
+pub const EXPANDER_CMD_TMDS: u32 = 2 << 12;
+pub const EXPANDER_CMD_NOP: u32 = 0xf << 12;
 
 /// Supported color formats for the hardware TMDS encoder.
 #[derive(Clone, Copy, Debug)]
