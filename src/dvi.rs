@@ -1,8 +1,8 @@
 //! DVI timing and command-list generation for RP2350 HSTX.
 //!
 //! Peripheral setup (clocks, pin roles, TMDS encoder) is handled directly
-//! via `rp235x_hal::hstx::Hstx` in main.rs. This module only builds the
-//! constant command-list data that gets DMA'd into the HSTX FIFO.
+//! via `rp_pac` in main.rs. This module only builds the constant command-list
+//! data that gets DMA'd into the HSTX FIFO.
 
 pub const EXPANDER_CMD_RAW_REPEAT: u32 = 1 << 12;
 pub const EXPANDER_CMD_TMDS: u32 = 2 << 12;
@@ -10,19 +10,17 @@ pub const EXPANDER_CMD_NOP: u32 = 0xf << 12;
 
 /// Supported color formats for the hardware TMDS encoder.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub enum ColorFormat {
-    Rgb332,
-    Rgb565,
+    Luma8,
 }
 
 impl ColorFormat {
     /// (rotation, nbits-1) for (Lane0/Blue, Lane1/Green, Lane2/Red),
-    /// for passing straight into `Hstx::configure_tmds`.
+    /// for writing into `HSTX_CTRL.EXPAND_TMDS`.
     pub const fn tmds_lanes_config(&self) -> ((u8, u8), (u8, u8), (u8, u8)) {
         match self {
-            Self::Rgb332 => ((26, 1), (29, 2), (0, 2)),
-            Self::Rgb565 => ((0, 4), (5, 5), (11, 4)),
+            // All three TMDS lanes read the same 8-bit luma byte (bits [7:0]).
+            Self::Luma8 => ((26, 1), (29, 2), (0, 2)),
         }
     }
 }
@@ -55,6 +53,7 @@ impl DviTiming {
 }
 
 /// Pre-calculated HSTX command-expander line buffers.
+#[derive(Clone, Copy)]
 pub struct DviLineCommands {
     pub vblank_vsync_on: [u32; 7],
     pub vblank_vsync_off: [u32; 7],

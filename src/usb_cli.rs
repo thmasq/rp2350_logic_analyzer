@@ -5,7 +5,7 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender};
 use heapless::String;
 use portable_atomic::Ordering;
 
-use crate::{DVI_FRAMES, UsbDriver};
+use crate::{DVI_FRAMES, UsbDriver, VIDEO_FRAME};
 
 async fn write_str(sender: &mut Sender<'static, UsbDriver>, text: &str) {
     for chunk in text.as_bytes().chunks(64) {
@@ -28,28 +28,31 @@ async fn handle_cli_command(cmd_line: &str, sender: &mut Sender<'static, UsbDriv
             write_str(
                 sender,
                 "\r\n--- RP2350 Logic Analyzer CLI ---\r\n\
-                     status   : Show clock frequencies, uptime & DVI frame count\r\n\
-                     bootsel  : Reboot into USB BOOTSEL mode\r\n\
-                     help     : Show this help message\r\n",
+                         status   : Show clock frequencies, uptime & DVI frame count\r\n\
+                         bootsel  : Reboot into USB BOOTSEL mode\r\n\
+                         help     : Show this help message\r\n",
             )
             .await;
             return;
         }
         "status" => {
             let frames = DVI_FRAMES.load(Ordering::Relaxed);
+            let video_frame = VIDEO_FRAME.load(Ordering::Relaxed);
             let uptime_ms = Instant::now().as_millis();
             let _ = write!(
                 out,
                 "\r\n[Status]\r\n\
-                     clk_sys    : {} Hz\r\n\
-                     clk_usb    : {} Hz\r\n\
-  		     clk_hstx   : {} Hz\r\n\
-                     DVI Frames : {}\r\n\
-                     Uptime     : {}.{:03} s\r\n",
+                         clk_sys    : {} Hz\r\n\
+                         clk_usb    : {} Hz\r\n\
+                         clk_hstx   : {} Hz\r\n\
+                         DVI Frames : {}\r\n\
+                         Video Frm  : {}\r\n\
+                         Uptime     : {}.{:03} s\r\n",
                 clk_sys_freq(),
                 clk_usb_freq(),
                 clk_sys_freq() / 2,
                 frames,
+                video_frame,
                 uptime_ms / 1000,
                 uptime_ms % 1000,
             );
@@ -77,7 +80,7 @@ pub async fn cdc_cli_task(cdc: CdcAcmClass<'static, UsbDriver>) -> ! {
         receiver.wait_connection().await;
         write_str(
             &mut sender,
-            "\r\n===	RP2350 Logic Analyzer Ready (Type 'help') ===\r\n> ",
+            "\r\n=== RP2350 Logic Analyzer Ready (Type 'help') ===\r\n> ",
         )
         .await;
 

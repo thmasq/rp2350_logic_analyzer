@@ -6,11 +6,12 @@ mod dvi;
 mod reset_iface;
 mod usb_cli;
 
+use core::cell::UnsafeCell;
 use defmt::{debug, info};
 use defmt_rtt as _;
 use dvi::{ColorFormat, DviLineCommands, DviTiming};
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::join::join3;
 use embassy_rp::{
     bind_interrupts,
     block::ImageDef,
@@ -20,11 +21,12 @@ use embassy_rp::{
     peripherals::USB,
     usb::{self, Driver},
 };
+use embassy_time::Timer;
 use embassy_usb::{
     Builder, Config as UsbConfig,
     class::cdc_acm::{CdcAcmClass, State as CdcState},
 };
-use portable_atomic::{AtomicU32, Ordering};
+use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 use rp_pac::{
     clocks::vals::ClkHstxCtrlAuxsrc,
     dma::{
@@ -52,53 +54,46 @@ bind_interrupts!(pub struct Irqs {
 pub type UsbDriver = Driver<'static, USB>;
 
 pub static DVI_FRAMES: AtomicU32 = AtomicU32::new(0);
+pub static VIDEO_FRAME: AtomicU32 = AtomicU32::new(0);
 
-// Generate our command lists at compile-time.
 static DVI_COMMANDS: DviLineCommands = DviLineCommands::new(&DviTiming::VGA_640X480_60HZ);
 
-// 640 pixels per line, RGB332 (1 byte/pixel) => 640 bytes = 160 u32s.
-const fn build_checkerboard(start_red: bool) -> [u32; 160] {
-    const RED: u32 = 0xE0_E0_E0_E0;
-    const BLACK: u32 = 0x00_00_00_00;
-    let mut arr = [0u32; 160];
-    let mut i = 0;
-    while i < 160 {
-        let is_red_chunk = (i / 4) % 2 == 0;
-        arr[i] = if is_red_chunk == start_red {
-            RED
-        } else {
-            BLACK
-        };
-        i += 1;
-    }
-    arr
-}
+static BAD_APPLE_DATA: &[u8] = include_bytes!("bad_apple.bin");
 
-static PIXELS_EVEN: [u32; 160] = build_checkerboard(true);
-static PIXELS_ODD: [u32; 160] = build_checkerboard(false);
+const FB_WIDTH: usize = 80;
+const FB_HEIGHT: usize = 60;
+const FB_ROW_BYTES: usize = FB_WIDTH / 8; // 10 bytes per 80-pixel row
+const FB_BYTES: usize = FB_ROW_BYTES * FB_HEIGHT; // 600 bytes per frame
 
 const V_BLANK_OFF_FRONT: usize = 10;
 const V_SYNC_ON: usize = 2;
 const V_BLANK_TOTAL: usize = 45; // 10 + 2 + 33
 const NUM_BLOCKS: usize = V_BLANK_TOTAL + (480 * 2);
 
-fn block_for_index(i: usize) -> &'static [u32] {
-    if i < V_BLANK_OFF_FRONT {
-        &DVI_COMMANDS.vblank_vsync_off
-    } else if i < V_BLANK_OFF_FRONT + V_SYNC_ON {
-        &DVI_COMMANDS.vblank_vsync_on
-    } else if i < V_BLANK_TOTAL {
-        &DVI_COMMANDS.vblank_vsync_off
-    } else {
-        let active_idx = i - V_BLANK_TOTAL;
-        let y = active_idx / 2;
-        if active_idx % 2 == 0 {
-            &DVI_COMMANDS.vactive
-        } else if (y / 16) % 2 == 0 {
-            &PIXELS_EVEN
-        } else {
-            &PIXELS_ODD
+struct SyncFramebuffers(UnsafeCell<[[u8; FB_BYTES]; 2]>);
+unsafe impl Sync for SyncFramebuffers {}
+
+static FB_BUFS: SyncFramebuffers = SyncFramebuffers(UnsafeCell::new([[0u8; FB_BYTES]; 2]));
+static FRAME_READY: AtomicBool = AtomicBool::new(false);
+
+/// Expand 2 source bytes (16 pixels) into 32 u32 words (128 pixels, 8x scale).
+#[inline(always)]
+unsafe fn expand_2_bytes_unchecked(src_row: *const u8, dst_line: *mut u32, byte_offset: usize) {
+    let mut i = 0;
+    while i < 2 {
+        let b = unsafe { *src_row.add(byte_offset + i) };
+        let base = (byte_offset + i) * 16;
+        let mut bit = 0;
+        while bit < 8 {
+            let w = 0u32.wrapping_sub(((b >> (7 - bit)) & 1) as u32);
+            let idx = base + bit * 2;
+            unsafe {
+                *dst_line.add(idx) = w;
+                *dst_line.add(idx + 1) = w;
+            }
+            bit += 1;
         }
+        i += 1;
     }
 }
 
@@ -140,7 +135,7 @@ fn init_hstx() {
     });
 
     // 5. Configure TMDS lane rotations and bit counts
-    let (l0, l1, l2) = ColorFormat::Rgb332.tmds_lanes_config();
+    let (l0, l1, l2) = ColorFormat::Luma8.tmds_lanes_config();
     let tmds_val = ((l0.0 as u32) & 0x1f)
         | (((l0.1 as u32) & 0x07) << 5)
         | (((l1.0 as u32) & 0x1f) << 8)
@@ -197,21 +192,106 @@ fn make_dma_ctrl(chain_to: u8) -> CtrlTrig {
     c
 }
 
+/// Runs entirely out of SRAM (`.data.core1_loop`) with zero calls to Flash
+/// and zero Flash reads, so Core 0 XIP activity can never stall DVI timing.
+#[inline(never)]
+#[unsafe(link_section = ".data.core1_loop")]
+fn core1_dvi_ram_loop(cmds: &DviLineCommands, line_bufs: &mut [[u32; 160]; 2]) -> ! {
+    let dma = rp_pac::DMA;
+    let mut front_fb: usize = 0;
+    let mut cur_ch: usize = 0;
+    let mut idx: usize = 2;
+
+    loop {
+        while dma.ch(cur_ch).ctrl_trig().read().busy() {
+            core::hint::spin_loop();
+        }
+
+        let (ptr, len): (*const u32, u32) = if idx < V_BLANK_OFF_FRONT {
+            (cmds.vblank_vsync_off.as_ptr(), 7)
+        } else if idx < V_BLANK_OFF_FRONT + V_SYNC_ON {
+            (cmds.vblank_vsync_on.as_ptr(), 7)
+        } else if idx < V_BLANK_TOTAL {
+            (cmds.vblank_vsync_off.as_ptr(), 7)
+        } else {
+            let active_idx = idx - V_BLANK_TOTAL;
+            let y = active_idx >> 1;
+            let fb_y = y >> 3;
+            let buf_slot = fb_y & 1;
+
+            if (active_idx & 1) == 0 {
+                (cmds.vactive.as_ptr(), 7)
+            } else {
+                (unsafe { line_bufs.get_unchecked(buf_slot).as_ptr() }, 160)
+            }
+        };
+
+        dma.ch(cur_ch).read_addr().write_value(ptr as u32);
+        dma.ch(cur_ch).trans_count().write_value(ChTransCount(len));
+
+        if idx >= 38 && idx < 43 {
+            let fb_ptr = unsafe { (*FB_BUFS.0.get()).get_unchecked(front_fb).as_ptr() };
+            let line0_ptr = unsafe { line_bufs.get_unchecked_mut(0).as_mut_ptr() };
+            unsafe { expand_2_bytes_unchecked(fb_ptr, line0_ptr, (idx - 38) * 2) };
+        } else if idx >= V_BLANK_TOTAL {
+            let active_idx = idx - V_BLANK_TOTAL;
+            if (active_idx & 1) == 1 {
+                let y = active_idx >> 1;
+                let sub_y = y & 7;
+                let next_fb_y = (y >> 3) + 1;
+                if sub_y < 5 && next_fb_y < FB_HEIGHT {
+                    let fb_ptr = unsafe { (*FB_BUFS.0.get()).get_unchecked(front_fb).as_ptr() };
+                    let row_ptr = unsafe { fb_ptr.add(next_fb_y * FB_ROW_BYTES) };
+                    let next_slot = next_fb_y & 1;
+                    let dst_ptr = unsafe { line_bufs.get_unchecked_mut(next_slot).as_mut_ptr() };
+                    unsafe { expand_2_bytes_unchecked(row_ptr, dst_ptr, sub_y * 2) };
+                }
+            }
+        }
+
+        cur_ch ^= 1;
+        idx += 1;
+        if idx == NUM_BLOCKS {
+            idx = 0;
+            let dvi_frame = DVI_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+            if (dvi_frame & 1) == 0 && FRAME_READY.load(Ordering::Acquire) {
+                front_fb ^= 1;
+                FRAME_READY.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 fn core1_dvi_loop() -> ! {
+    static LINE_BUFS_CELL: StaticCell<[[u32; 160]; 2]> = StaticCell::new();
+    static CMD_CELL: StaticCell<DviLineCommands> = StaticCell::new();
+
+    let line_bufs = LINE_BUFS_CELL.init_with(|| [[0u32; 160]; 2]);
+    let cmds = CMD_CELL.init_with(|| DVI_COMMANDS);
+
+    // Pre-expand row 0 of frame 0 before starting DMA
+    {
+        let fb_ptr = unsafe { (*FB_BUFS.0.get())[0].as_ptr() };
+        let line0_ptr = line_bufs[0].as_mut_ptr();
+        for chunk in 0..5 {
+            unsafe { expand_2_bytes_unchecked(fb_ptr, line0_ptr, chunk * 2) };
+        }
+    }
+
     let dma = rp_pac::DMA;
     let fifo_addr = rp_pac::HSTX_FIFO.fifo().as_ptr() as u32;
 
     let ctrl_ch0 = make_dma_ctrl(1);
     let ctrl_ch1 = make_dma_ctrl(0);
 
-    let b0 = block_for_index(0);
+    let b0 = &cmds.vblank_vsync_off;
     dma.ch(0).read_addr().write_value(b0.as_ptr() as u32);
     dma.ch(0).write_addr().write_value(fifo_addr);
     dma.ch(0)
         .trans_count()
         .write_value(ChTransCount(b0.len() as u32));
 
-    let b1 = block_for_index(1);
+    let b1 = &cmds.vblank_vsync_off;
     dma.ch(1).read_addr().write_value(b1.as_ptr() as u32);
     dma.ch(1).write_addr().write_value(fifo_addr);
     dma.ch(1)
@@ -222,25 +302,35 @@ fn core1_dvi_loop() -> ! {
     // Kick off ping-pong chain by writing ch0's trigger register
     dma.ch(0).ctrl_trig().write_value(ctrl_ch0);
 
-    let mut cur_ch: usize = 0;
-    let mut idx: usize = 2;
+    // Indirect call so ARM Thumb-2 jumps cleanly from Flash (.text) to SRAM (.data)
+    let ram_loop: fn(&DviLineCommands, &mut [[u32; 160]; 2]) -> ! =
+        core::hint::black_box(core1_dvi_ram_loop);
+    ram_loop(cmds, line_bufs)
+}
+
+async fn frame_prefetch_task() -> ! {
+    let total_vid_frames = (BAD_APPLE_DATA.len() / FB_BYTES).max(1);
+    let mut next_vid_frame: usize = 1 % total_vid_frames;
+    let mut back_fb: usize = 0;
 
     loop {
-        while dma.ch(cur_ch).ctrl_trig().read().busy() {
-            core::hint::spin_loop();
-        }
-
-        let buf = block_for_index(idx);
-        dma.ch(cur_ch).read_addr().write_value(buf.as_ptr() as u32);
-        dma.ch(cur_ch)
-            .trans_count()
-            .write_value(ChTransCount(buf.len() as u32));
-
-        cur_ch ^= 1;
-        idx += 1;
-        if idx == NUM_BLOCKS {
-            idx = 0;
-            DVI_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if !FRAME_READY.load(Ordering::Acquire) {
+            next_vid_frame += 1;
+            if next_vid_frame >= total_vid_frames {
+                next_vid_frame = 0;
+            }
+            let src_start = next_vid_frame * FB_BYTES;
+            if src_start + FB_BYTES <= BAD_APPLE_DATA.len() {
+                unsafe {
+                    (&mut *FB_BUFS.0.get())[back_fb]
+                        .copy_from_slice(&BAD_APPLE_DATA[src_start..src_start + FB_BYTES]);
+                }
+            }
+            VIDEO_FRAME.store(next_vid_frame as u32, Ordering::Relaxed);
+            back_fb ^= 1;
+            FRAME_READY.store(true, Ordering::Release);
+        } else {
+            Timer::after_millis(1).await;
         }
     }
 }
@@ -274,16 +364,30 @@ async fn main(_spawner: Spawner) {
     let mut led = Output::new(p.PIN_25, Level::High);
     debug!("LED turned on");
 
-    // 2. Initialize HSTX and spawn Core 1 to drive the DVI DMA ping-pong loop
+    // 2. Preload frame 0 and frame 1 into SRAM double-buffer before starting Core 1
+    let total_vid_frames = (BAD_APPLE_DATA.len() / FB_BYTES).max(1);
+    unsafe {
+        let bufs = &mut *FB_BUFS.0.get();
+        if BAD_APPLE_DATA.len() >= FB_BYTES {
+            bufs[0].copy_from_slice(&BAD_APPLE_DATA[0..FB_BYTES]);
+        }
+        let f1_start = (1 % total_vid_frames) * FB_BYTES;
+        if f1_start + FB_BYTES <= BAD_APPLE_DATA.len() {
+            bufs[1].copy_from_slice(&BAD_APPLE_DATA[f1_start..f1_start + FB_BYTES]);
+        }
+    }
+    FRAME_READY.store(true, Ordering::Release);
+
+    // 3. Initialize HSTX and spawn Core 1 to drive the DVI DMA ping-pong loop
     init_hstx();
     debug!("HSTX enabled");
 
-    static CORE1_STACK: StaticCell<Stack<4096>> = StaticCell::new();
+    static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
     spawn_core1(p.CORE1, CORE1_STACK.init(Stack::new()), core1_dvi_loop);
     led.set_low();
     info!("Core 1 spawned for steady-state DVI DMA loop");
 
-    // 3. Configure USB (CDC-ACM CLI + Picotool Reset Interface)
+    // 4. Configure USB (CDC-ACM CLI + Picotool Reset Interface)
     let serial_str = format_serial(embassy_rp::otp::get_chipid().unwrap_or(0));
 
     let mut usb_cfg = UsbConfig::new(0x2E8A, 0x000A);
@@ -342,5 +446,5 @@ async fn main(_spawner: Spawner) {
 
     let mut usb = builder.build();
 
-    join(usb.run(), usb_cli::cdc_cli_task(cdc)).await;
+    join3(usb.run(), usb_cli::cdc_cli_task(cdc), frame_prefetch_task()).await;
 }
